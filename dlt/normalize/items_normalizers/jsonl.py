@@ -15,6 +15,7 @@ from dlt.common.json import (
 )
 from dlt.common.schema import utils
 from dlt.common.schema.typing import (
+    COLUMN_MAPPING_KEY,
     TColumnSchema,
     TPartialTableSchema,
     TSchemaEvolutionMode,
@@ -155,6 +156,17 @@ class JsonLItemsNormalizer(ItemsNormalizer):
 
                     # coerce row of values into schema table, generating partial table with new columns if any
                     row, partial_table = self._coerce_row(table_name, parent_table, row)
+
+                    # mapping deltas wait until a missing table gets created
+                    if partial_table is not None or table_name in schema.tables:
+                        if mapping_delta := schema.data_item_normalizer.pop_column_mapping_delta(
+                            table_name
+                        ):
+                            if partial_table is None:
+                                partial_table = TPartialTableSchema(name=table_name, columns={})
+                                if parent_table:
+                                    partial_table["parent"] = parent_table
+                            partial_table[COLUMN_MAPPING_KEY] = mapping_delta
 
                     # if we detect a migration, check schema contract
                     if partial_table:

@@ -2,6 +2,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Final,
     List,
     Literal,
     NamedTuple,
@@ -204,6 +205,11 @@ class TColumnSchema(TColumnSchemaBase, total=False):
 
 TTableSchemaColumns = Dict[str, TColumnSchema]
 """A mapping from column name to column schema, typically part of a table schema"""
+
+COLUMN_MAPPING_KEY: Final = "x-column-mapping"
+"""Table schema key holding the source path to column name mapping"""
+TColumnMapping = Dict[str, str]
+"""Maps a JSON-serialized source path of original field names to a column name"""
 
 
 TAnySchemaColumns = Union[
@@ -437,7 +443,15 @@ class TTableReferenceStandalone(_TTableReferenceBase, TypedDict, total=False):
 TTableReferenceParam = Sequence[TTableReference]
 
 
-class _TTableSchemaBase(TTableProcessingHints, total=False):
+# lineage must survive remove_processing_hints, so it stays out of `TTableProcessingHints`
+TTableColumnMapping = TypedDict(
+    "TTableColumnMapping",
+    {"x-column-mapping": Optional[TColumnMapping]},
+    total=False,
+)
+
+
+class _TTableSchemaBase(TTableProcessingHints, TTableColumnMapping, total=False):
     name: Optional[str]
     description: Optional[str]
     schema_contract: Optional[TSchemaContract]

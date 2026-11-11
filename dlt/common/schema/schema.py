@@ -35,6 +35,8 @@ from dlt.common.schema.typing import (
     LOADS_TABLE_NAME,
     VERSION_TABLE_NAME,
     PIPELINE_STATE_TABLE_NAME,
+    COLUMN_MAPPING_KEY,
+    TColumnMapping,
     TPartialTableSchema,
     TSchemaContractEntities,
     TSchemaEvolutionMode,
@@ -61,6 +63,7 @@ from dlt.common.schema.exceptions import (
     SchemaCorruptedException,
     TableIdentifiersFrozen,
     TableNotFound,
+    ColumnMappingConflictException,
 )
 from dlt.common.schema.utils import is_complete_column
 from dlt.common.schema.normalizers import import_normalizers, configured_normalizers
@@ -387,10 +390,47 @@ class Schema:
         if table is None:
             self._schema_tables[table_name] = partial_table
         else:
+            if COLUMN_MAPPING_KEY in partial_table:
+                self._merge_column_mapping(table, partial_table[COLUMN_MAPPING_KEY])
             partial_table = utils.merge_table(self.name, table, partial_table, merge_compound_props)
 
         self.data_item_normalizer.extend_table(table_name)
         return partial_table
+
+    def _merge_column_mapping(self, table: TTableSchema, incoming: TColumnMapping) -> None:
+        """Union-merges `incoming` into the table mapping, raising on contradicting entries"""
+        if not incoming:
+            return
+        stored = table.setdefault(COLUMN_MAPPING_KEY, {})
+        conflict_mode = ((self._normalizers_config.get("json") or {}).get("config") or {}).get(
+            "column_mapping_conflict", "merge"
+        )
+        claimed = {col_name: src_path for src_path, col_name in stored.items()}
+        for src_path, col_name in incoming.items():
+            prev_col_name = stored.get(src_path)
+            if prev_col_name is None:
+                if conflict_mode != "merge" and col_name in claimed:
+                    raise ColumnMappingConflictException(
+                        self.name,
+                        table["name"],
+                        col_name,
+                        src_path,
+                        claimed[col_name],
+                        "Detected when merging schema updates, a retry with a merged schema"
+                        " may resolve it.",
+                    )
+                stored[src_path] = col_name
+                claimed[col_name] = src_path
+            elif prev_col_name != col_name:
+                raise ColumnMappingConflictException(
+                    self.name,
+                    table["name"],
+                    col_name,
+                    src_path,
+                    src_path,
+                    f"The source path is already mapped to column `{prev_col_name}` and may not"
+                    " be remapped.",
+                )
 
     def update_schema(self, schema: "Schema") -> None:
         """Updates this schema from an incoming schema. Normalizes identifiers after updating normalizers."""
@@ -582,6 +622,16 @@ class Schema:
             return table["columns"]
         else:
             return {k: v for k, v in table["columns"].items() if utils.is_complete_column(v)}
+
+    def get_column_mapping(self, table_name: str) -> TColumnMapping:
+        """Gets the source path to column name mapping of `table_name`.
+
+        Keys are JSON-serialized lists of the original (not normalized) field names forming
+        the path to a field in the source data, values are the column names in this schema.
+        The mapping is persisted in the schema and stable across loads.
+        """
+        table = self.get_table(table_name)
+        return dict(table.get(COLUMN_MAPPING_KEY) or {})
 
     def data_tables(
         self, seen_data_only: bool = False, include_incomplete: bool = False
@@ -1172,6 +1222,8 @@ class Schema:
                 # TODO: when lineage is fully implemented we should use source identifiers
                 # not `table` which was already normalized
                 norm_table = utils.normalize_table_identifiers(table, to_naming)
+                # mapped names may change with naming convention; rebuilt on next normalize
+                norm_table.pop(COLUMN_MAPPING_KEY, None)
                 table_seen_data = utils.has_table_seen_data(norm_table)
                 if table_seen_data:
                     _verify_identifiers(table, norm_table)

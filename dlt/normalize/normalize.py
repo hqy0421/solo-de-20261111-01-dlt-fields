@@ -19,7 +19,7 @@ from dlt.common.storages import (
     LoadStorage,
 )
 from dlt.common.schema import Schema
-from dlt.common.schema.exceptions import CannotCoerceColumnException
+from dlt.common.schema.exceptions import CannotCoerceColumnException, ColumnMappingConflictException
 from dlt.common.pipeline import (
     NormalizeInfo,
     NormalizeMetrics,
@@ -161,7 +161,7 @@ class Normalize(Runnable[Executor], WithStepInfo[NormalizeMetrics, NormalizeInfo
                                 summary.null_only_columns.setdefault(tn, set()).update(cols)
                             # collect any remaining progress from this worker
                             self._collect_and_update_progress(load_id)
-                        except CannotCoerceColumnException as exc:
+                        except (CannotCoerceColumnException, ColumnMappingConflictException) as exc:
                             # schema conflicts resulting from parallel executing
                             logger.warning(
                                 f"Parallel schema update conflict, retrying task ({str(exc)}"

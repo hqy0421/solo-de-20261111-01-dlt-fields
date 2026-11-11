@@ -1,5 +1,16 @@
 import abc
-from typing import Any, Dict, Generic, Type, Generator, Protocol, Tuple, TYPE_CHECKING, TypeVar
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Optional,
+    Type,
+    Generator,
+    Protocol,
+    Tuple,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
 from dlt.common.typing import DictStrAny, TDataItem, StrAny
 from dlt.common.data_types.typing import TDataType
@@ -42,6 +53,10 @@ class DataItemNormalizer(abc.ABC, Generic[TNormalizerConfig]):
     @abc.abstractmethod
     def remove_table(self, table_name: str) -> None:
         pass
+
+    def pop_column_mapping_delta(self, table_name: str) -> Optional[Dict[str, str]]:
+        """Returns new source path to column mappings for `table_name` and clears them"""
+        return None
 
     @property
     def py_type_to_sc_type_map(self) -> Dict[Type[Any], TDataType]:

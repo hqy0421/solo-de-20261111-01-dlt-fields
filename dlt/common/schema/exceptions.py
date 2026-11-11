@@ -261,6 +261,31 @@ class ColumnNameConflictException(SchemaException):
     pass
 
 
+class ColumnMappingConflictException(SchemaException):
+    """Raised when two source paths claim the same column and the conflict cannot be resolved"""
+
+    def __init__(
+        self,
+        schema_name: str,
+        table_name: str,
+        column_name: str,
+        source_path: str,
+        conflict_source_path: str,
+        extended_info: str = "",
+    ) -> None:
+        self.table_name = table_name
+        self.column_name = column_name
+        self.source_path = source_path
+        self.conflict_source_path = conflict_source_path
+        msg = (
+            f"Source path `{source_path}` and `{conflict_source_path}` in table `{table_name}`"
+            f" both map to column `{column_name}`."
+        )
+        if extended_info:
+            msg += " " + extended_info
+        super().__init__(schema_name, msg)
+
+
 class UnboundColumnException(SchemaException):
     def __init__(self, schema_name: str, table_name: str, columns: List[TColumnSchemaBase]) -> None:
         self.columns = columns

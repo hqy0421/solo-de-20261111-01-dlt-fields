@@ -15,10 +15,12 @@ from dlt.common.utils import uniq_id
 from dlt.common.schema import Schema, TStoredSchema, utils
 from dlt.common.schema.exceptions import (
     CannotCoerceColumnException,
+    ColumnMappingConflictException,
     IncompatibleSchemaException,
     InvalidSchemaName,
     ParentTableNotFoundException,
     SchemaCorruptedException,
+    TableNotFound,
 )
 from dlt.common.schema.typing import (
     C_DLT_LOADS_TABLE_LOAD_ID,
@@ -1360,3 +1362,102 @@ def test_unify_schemas_verbatim_across_conventions() -> None:
     assert unified.get_table_columns("EVENTS📊").keys() == {"EVENT_ID"}
     assert unified.get_table_columns("EVENTS📊__DETAILS").keys() == {"PAYLOAD"}
     assert unified.get_table("EVENTS📊__DETAILS")["parent"] == "EVENTS📊"
+
+
+def test_update_table_merges_column_mapping() -> None:
+    schema = Schema("mapped")
+    schema.update_table(utils.new_table("mock_table"), normalize_identifiers=False)
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["c"]': "c"}},
+        normalize_identifiers=False,
+    )
+    assert schema.get_column_mapping("mock_table") == {'["a","b"]': "a__b", '["c"]': "c"}
+    # identical entries merge cleanly
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    # the mapping is persisted in the stored schema
+    assert Schema.from_dict(schema.to_dict()).get_column_mapping("mock_table") == {
+        '["a","b"]': "a__b",
+        '["c"]': "c",
+    }
+
+
+def test_update_table_column_mapping_conflicts() -> None:
+    schema = Schema("mapped")
+    schema.update_table(utils.new_table("mock_table"), normalize_identifiers=False)
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    # remapping a source path to another column always raises
+    with pytest.raises(ColumnMappingConflictException):
+        schema.update_table(
+            {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "other"}},
+            normalize_identifiers=False,
+        )
+    # in the default merge mode two source paths may share a column
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["c"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    assert schema.get_column_mapping("mock_table") == {'["a","b"]': "a__b", '["c"]': "a__b"}
+
+
+@pytest.mark.parametrize("mode", ("disambiguate", "reject"), ids=("disambiguate", "reject"))
+def test_update_table_column_mapping_shared_column_raises(mode: str) -> None:
+    schema = Schema(
+        "mapped",
+        normalizers={
+            "names": "snake_case",
+            "json": {"module": "relational", "config": {"column_mapping_conflict": mode}},
+        },
+    )
+    schema.update_table(utils.new_table("mock_table"), normalize_identifiers=False)
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    # a second source path claiming the same column raises outside merge mode
+    with pytest.raises(ColumnMappingConflictException):
+        schema.update_table(
+            {"name": "mock_table", "columns": {}, "x-column-mapping": {'["c"]': "a__b"}},
+            normalize_identifiers=False,
+        )
+
+
+def test_get_column_mapping() -> None:
+    schema = Schema("mapped")
+    schema.update_table(utils.new_table("mock_table"), normalize_identifiers=False)
+    # tables without recorded mappings have an empty mapping
+    assert schema.get_column_mapping("mock_table") == {}
+    with pytest.raises(TableNotFound):
+        schema.get_column_mapping("unknown_table")
+
+
+def test_clone_keeps_column_mapping() -> None:
+    # the column mapping is persisted lineage, not a processing hint
+    schema = Schema("mapped")
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    cloned = schema.clone(remove_processing_hints=True)
+    assert cloned.get_column_mapping("mock_table") == {'["a","b"]': "a__b"}
+
+
+def test_update_normalizers_drops_column_mapping() -> None:
+    schema = Schema("mapped")
+    schema.update_table(
+        {"name": "mock_table", "columns": {}, "x-column-mapping": {'["a","b"]': "a__b"}},
+        normalize_identifiers=False,
+    )
+    os.environ["SCHEMA__NAMING"] = "direct"
+    schema.update_normalizers()
+    # mapped column names may change with the naming convention so the mapping is dropped
+    assert "x-column-mapping" not in schema.tables["mock_table"]

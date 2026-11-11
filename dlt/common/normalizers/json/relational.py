@@ -1,5 +1,6 @@
 from functools import lru_cache, partial
 from importlib import import_module
+import json as std_json
 from typing import (
     ClassVar,
     Dict,
@@ -13,6 +14,7 @@ from typing import (
     Any,
 )
 
+from dlt.common import logger
 from dlt.common.data_types.type_helpers import (
     PY_TYPE_TO_SC_TYPE,
     _COERCE_DISPATCH,
@@ -21,13 +23,17 @@ from dlt.common.data_types.type_helpers import (
 )
 from dlt.common.data_types.typing import TDataType
 from dlt.common.normalizers.exceptions import InvalidJsonNormalizer
+from dlt.common.normalizers.naming import NamingConvention
 from dlt.common.normalizers.typing import TJSONNormalizer
 from dlt.common.normalizers.utils import generate_dlt_id
 from dlt.common.typing import DictStrAny, TDataItem, StrAny
 from dlt.common.schema import Schema
+from dlt.common.schema.exceptions import ColumnMappingConflictException
 from dlt.common.schema.typing import (
     C_DLT_ID,
     C_DLT_LOAD_ID,
+    COLUMN_MAPPING_KEY,
+    TColumnMapping,
     TColumnName,
     TSimpleRegex,
 )
@@ -45,6 +51,7 @@ from dlt.common.normalizers.json import (
 from dlt.common.normalizers.json.typing import (
     RelationalNormalizerConfig,
     RelationalNormalizerConfigPropagation,
+    TColumnMappingConflictMode,
 )
 from dlt.common.normalizers.json import helpers as normalize_helpers
 from dlt.common.normalizers.json.helpers import (
@@ -54,6 +61,15 @@ from dlt.common.normalizers.json.helpers import (
     requires_root_key,
 )
 from dlt.common.validation import validate_dict
+
+
+def _serialize_source_path(source_path: Tuple[str, ...]) -> str:
+    """Serializes a source path for use as a column mapping key, independent of the json backend"""
+    return std_json.dumps(list(source_path), separators=(",", ":"))
+
+
+def _deserialize_source_path(serialized_path: str) -> Tuple[str, ...]:
+    return tuple(std_json.loads(serialized_path))
 
 
 class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
@@ -75,6 +91,9 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
     propagation_config: RelationalNormalizerConfigPropagation
     max_nesting: int
     _skip_primary_key: Dict[str, bool]
+    _column_mappings: Dict[str, Dict[Tuple[str, ...], str]]
+    _claimed_columns: Dict[str, Dict[str, Tuple[str, ...]]]
+    _column_mapping_deltas: Dict[str, Dict[Tuple[str, ...], str]]
 
     def __init__(self, schema: Schema) -> None:
         """This item normalizer works with nested dictionaries. It flattens dictionaries and descends into lists.
@@ -106,6 +125,12 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         self.normalizer_config = self.schema._normalizers_config["json"].get("config") or {}  # type: ignore[assignment]
         self.propagation_config = self.normalizer_config.get("propagation", None)
         self.max_nesting = self.normalizer_config.get("max_nesting", 1000)
+        self._column_mapping_conflict: TColumnMappingConflictMode = (
+            self.normalizer_config.get("column_mapping_conflict") or "merge"
+        )
+        self._column_mappings = {}
+        self._claimed_columns = {}
+        self._column_mapping_deltas = {}
         self._skip_primary_key = {}
         # create cached versions of helper functions
         self._get_root_row_id_type = lru_cache(maxsize=None)(
@@ -151,6 +176,86 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
     def coerce_type(self, to_type: TDataType, from_type: TDataType, value: Any) -> Any:
         return coerce_value(to_type, from_type, value)
 
+    def _ensure_column_mapping(self, table: str) -> None:
+        if table not in self._column_mappings:
+            self._sync_column_mapping(table)
+
+    def _sync_column_mapping(self, table: str) -> None:
+        """Loads the persisted mapping of `table`, keeping entries created in this run"""
+        mapping = self._column_mappings.setdefault(table, {})
+        claimed = self._claimed_columns.setdefault(table, {})
+        stored = (self.schema.tables.get(table) or {}).get(COLUMN_MAPPING_KEY) or {}
+        for serialized_path, col_name in stored.items():
+            src_path = _deserialize_source_path(serialized_path)
+            if src_path not in mapping:
+                mapping[src_path] = col_name
+                claimed.setdefault(col_name, src_path)
+
+    def _resolve_column_name(
+        self, table: str, src_path: Tuple[str, ...], natural_name: str, record: bool
+    ) -> str:
+        """Maps a source path to its column name, recording new mappings unless `record` is False"""
+        mapping = self._column_mappings[table]
+        col_name = mapping.get(src_path)
+        if col_name is not None:
+            return col_name
+        if not record:
+            return natural_name
+        claimed = self._claimed_columns[table]
+        conflict_path = claimed.get(natural_name)
+        if conflict_path is None:
+            col_name = natural_name
+        elif self._column_mapping_conflict == "reject":
+            raise ColumnMappingConflictException(
+                self.schema.name,
+                table,
+                natural_name,
+                _serialize_source_path(src_path),
+                _serialize_source_path(conflict_path),
+                "The `column_mapping_conflict` config of the json normalizer is `reject`.",
+            )
+        elif self._column_mapping_conflict == "disambiguate":
+            col_name = self._disambiguate_column_name(table, src_path, natural_name)
+        else:
+            logger.warning(
+                f"In schema `{self.schema.name}` table `{table}`: source paths"
+                f" `{_serialize_source_path(conflict_path)}` and"
+                f" `{_serialize_source_path(src_path)}` both normalize to column"
+                f" `{natural_name}` and will share it. Set the json normalizer"
+                " `column_mapping_conflict` config to `disambiguate` or `reject` to change this."
+            )
+            col_name = natural_name
+        mapping[src_path] = col_name
+        claimed.setdefault(col_name, src_path)
+        self._column_mapping_deltas.setdefault(table, {})[src_path] = col_name
+        return col_name
+
+    def _disambiguate_column_name(
+        self, table: str, src_path: Tuple[str, ...], natural_name: str
+    ) -> str:
+        """Generates a deterministic name for `src_path` colliding with another source path"""
+        claimed = self._claimed_columns[table]
+        existing_columns = (self.schema.tables.get(table) or {}).get("columns", {})
+        serialized_path = _serialize_source_path(src_path)
+        salt = 0
+        while True:
+            tag = NamingConvention._compute_tag(
+                serialized_path if salt == 0 else f"{serialized_path}#{salt}",
+                NamingConvention._DEFAULT_COLLISION_PROB,
+            )
+            col_name = self._shorten_fragments(natural_name, tag)
+            if col_name not in claimed and col_name not in existing_columns:
+                return col_name
+            salt += 1
+
+    def pop_column_mapping_delta(self, table_name: str) -> Optional[TColumnMapping]:
+        delta = self._column_mapping_deltas.pop(table_name, None)
+        if not delta:
+            return None
+        return {
+            _serialize_source_path(src_path): col_name for src_path, col_name in delta.items()
+        }
+
     def _flatten(
         self, table: str, dict_row: DictStrAny, _r_lvl: int
     ) -> Tuple[DictStrAny, Dict[Tuple[str, ...], Sequence[Any]]]:
@@ -162,26 +267,41 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         normalize_table_identifier = self._normalize_table_identifier
         shorten_fragments = self._shorten_fragments
         is_nested_type = self._is_nested_type
+        resolve_column_name = self._resolve_column_name
         EMPTY_KEY = self.EMPTY_KEY_IDENTIFIER
+        self._ensure_column_mapping(table)
 
-        stack: List[Tuple[Dict[str, Any], int, Tuple[str, ...]]] = [(dict_row, _r_lvl, ())]
+        stack: List[Tuple[Dict[str, Any], int, Tuple[str, ...], Tuple[str, ...]]] = [
+            (dict_row, _r_lvl, (), ())
+        ]
 
         while stack:
-            current_row, r_lvl, path = stack.pop()
+            current_row, r_lvl, path, src_path = stack.pop()
             for k, v in current_row.items():
                 norm_k = normalize_identifier(k) if (k and not k.isspace()) else EMPTY_KEY
                 nested_name = norm_k if not path else shorten_fragments(*path, norm_k)
+                field_src_path = src_path + (k,)
                 v_type = type(v)
                 if v_type is dict:
-                    if not is_nested_type(table, nested_name, r_lvl):
-                        stack.append((v, r_lvl - 1, path + (norm_k,)))
+                    if not is_nested_type(
+                        table,
+                        resolve_column_name(table, field_src_path, nested_name, False),
+                        r_lvl,
+                    ):
+                        stack.append((v, r_lvl - 1, path + (norm_k,), field_src_path))
                         continue
                 elif v_type is list:
-                    if not is_nested_type(table, nested_name, r_lvl):
+                    if not is_nested_type(
+                        table,
+                        resolve_column_name(table, field_src_path, nested_name, False),
+                        r_lvl,
+                    ):
                         out_rec_list[path + (normalize_table_identifier(k),)] = v
                         continue
 
-                out_rec_row[nested_name] = v
+                out_rec_row[
+                    resolve_column_name(table, field_src_path, nested_name, v is not None)
+                ] = v
 
         return out_rec_row, out_rec_list
 
@@ -388,6 +508,7 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
                     }
                 },
             )
+        self._sync_column_mapping(table_name)
         # clear all caches that depend on schema.tables since table was added/modified
         self._clear_schema_caches()
 
@@ -397,6 +518,9 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         if propagation := config.get("propagation"):
             if tables := propagation.get("tables"):
                 tables.pop(table_name, None)
+        self._column_mappings.pop(table_name, None)
+        self._claimed_columns.pop(table_name, None)
+        self._column_mapping_deltas.pop(table_name, None)
         # clear all caches that depend on schema.tables since table was removed
         self._clear_schema_caches()
 

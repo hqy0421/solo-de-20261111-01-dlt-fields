@@ -8,6 +8,7 @@ from dlt.common.normalizers.naming import NamingConvention
 from dlt.common.schema.typing import TColumnName, TLoaderMergeStrategy, TSimpleRegex
 from dlt.common.utils import digest128, uniq_id
 from dlt.common.schema import Schema
+from dlt.common.schema.exceptions import ColumnMappingConflictException
 from dlt.common.schema.utils import new_table
 from dlt.common.normalizers.utils import DLT_ID_LENGTH_BYTES
 from dlt.common.normalizers.json.relational import (
@@ -1379,3 +1380,146 @@ def test_coerce_type(norm: RelationalNormalizer) -> None:
     # failure raises ValueError
     with pytest.raises(ValueError):
         norm.coerce_type("bigint", "text", "not_a_number")
+
+
+def _make_norm_with_conflict_mode(mode: str) -> RelationalNormalizer:
+    schema = Schema("mapped")
+    RelationalNormalizer.update_normalizer_config(schema, {"column_mapping_conflict": mode})
+    schema.data_item_normalizer._reset()
+    return schema.data_item_normalizer  # type: ignore[return-value]
+
+
+def test_column_mapping_recorded_for_source_paths(norm: RelationalNormalizer) -> None:
+    row = {"field": 1, "nested": {"inner": 2, "deep": {"deeper": 3}}, "a_list": [1, 2]}
+    flattened, lists = norm._flatten("mock_table", row, 1000)
+    # scalar and nested dict paths are mapped, list fields become tables and are not mapped
+    assert norm.pop_column_mapping_delta("mock_table") == {
+        '["field"]': "field",
+        '["nested","inner"]': "nested__inner",
+        '["nested","deep","deeper"]': "nested__deep__deeper",
+    }
+    # delta is cleared after pop
+    assert norm.pop_column_mapping_delta("mock_table") is None
+    # subsequent rows do not produce new deltas
+    norm._flatten("mock_table", row, 1000)
+    assert norm.pop_column_mapping_delta("mock_table") is None
+
+
+def test_column_mapping_distinguishes_nested_path_from_separator_key(
+    norm: RelationalNormalizer,
+) -> None:
+    # nested path ("a", "b") and literal key "a__b" both normalize to a__b
+    norm._flatten("mock_table", {"a__b": 1, "a": {"b": 2}}, 1000)
+    mapping = norm.pop_column_mapping_delta("mock_table")
+    assert set(mapping.keys()) == {'["a__b"]', '["a","b"]'}
+
+
+def test_column_mapping_null_values_not_recorded(norm: RelationalNormalizer) -> None:
+    flattened, _ = norm._flatten("mock_table", {"null_field": None, "nested": {"n": None}}, 1000)
+    assert flattened == {"null_field": None, "nested__n": None}
+    assert norm.pop_column_mapping_delta("mock_table") is None
+    # a null value still resolves to an already mapped column name
+    norm._flatten("mock_table", {"a__b": 1, "a": {"b": 2}}, 1000)
+    norm._flatten("mock_table", {"a": {"b": None}}, 1000)
+    assert norm.pop_column_mapping_delta("mock_table") == {
+        '["a__b"]': "a__b",
+        '["a","b"]': "a__b",
+    }
+
+
+@pytest.mark.parametrize(
+    "mode,expect_shared",
+    (("merge", True), ("disambiguate", False)),
+    ids=("merge_shares_column", "disambiguate_renames"),
+)
+def test_column_mapping_conflict_modes(mode: str, expect_shared: bool) -> None:
+    norm = _make_norm_with_conflict_mode(mode)
+    row = {"a__b": 1, "a": {"b": 2}}
+    flattened, _ = norm._flatten("mock_table", row, 1000)
+    mapping = norm.pop_column_mapping_delta("mock_table")
+    if expect_shared:
+        assert flattened == {"a__b": 2}
+        assert mapping == {'["a__b"]': "a__b", '["a","b"]': "a__b"}
+    else:
+        disambiguated = mapping['["a","b"]']
+        assert disambiguated != "a__b"
+        assert flattened == {"a__b": 1, disambiguated: 2}
+        # both source values are preserved
+        assert set(flattened.values()) == {1, 2}
+
+
+def test_column_mapping_conflict_reject() -> None:
+    norm = _make_norm_with_conflict_mode("reject")
+    with pytest.raises(ColumnMappingConflictException) as exc_info:
+        norm._flatten("mock_table", {"a__b": 1, "a": {"b": 2}}, 1000)
+    assert exc_info.value.table_name == "mock_table"
+    assert exc_info.value.column_name == "a__b"
+    # the conflicting path is rejected even when it arrives in a later row
+    norm = _make_norm_with_conflict_mode("reject")
+    norm._flatten("mock_table", {"a__b": 1}, 1000)
+    with pytest.raises(ColumnMappingConflictException):
+        norm._flatten("mock_table", {"a": {"b": 2}}, 1000)
+
+
+def test_column_mapping_disambiguation_is_deterministic() -> None:
+    row = {"a__b": 1, "a": {"b": 2}}
+    flattened_1, _ = _make_norm_with_conflict_mode("disambiguate")._flatten(
+        "mock_table", row, 1000
+    )
+    flattened_2, _ = _make_norm_with_conflict_mode("disambiguate")._flatten(
+        "mock_table", row, 1000
+    )
+    assert flattened_1 == flattened_2
+
+
+def test_column_mapping_stable_across_field_order_changes() -> None:
+    norm = _make_norm_with_conflict_mode("disambiguate")
+    flattened_1, _ = norm._flatten("mock_table", {"a__b": 1, "a": {"b": 2}}, 1000)
+    disambiguated = norm.pop_column_mapping_delta("mock_table")['["a","b"]']
+    # same fields in different order resolve to the same columns
+    flattened_2, _ = norm._flatten("mock_table", {"a": {"b": 2}, "a__b": 1}, 1000)
+    assert flattened_2 == flattened_1 == {"a__b": 1, disambiguated: 2}
+
+
+def test_column_mapping_restored_from_stored_schema() -> None:
+    # a mapping persisted in the schema tables is picked up by a fresh normalizer
+    schema = create_schema_with_name("mapped")
+    schema.update_table(
+        new_table("mock_table"),
+        normalize_identifiers=False,
+    )
+    schema.update_table(
+        {
+            "name": "mock_table",
+            "columns": {},
+            "x-column-mapping": {'["a","b"]': "a__b__disambiguated"},
+        },
+        normalize_identifiers=False,
+    )
+    norm = schema.data_item_normalizer
+    flattened, _ = norm._flatten("mock_table", {"a": {"b": 1}}, 1000)
+    assert flattened == {"a__b__disambiguated": 1}
+    # no new delta: the mapping was already persisted
+    assert norm.pop_column_mapping_delta("mock_table") is None
+
+
+def test_column_mapping_with_max_length_naming() -> None:
+    schema = Schema("mapped", normalizers={"names": "snake_case", "json": {"module": "relational"}})
+    schema.naming.max_length = 10
+    RelationalNormalizer.update_normalizer_config(
+        schema, {"column_mapping_conflict": "disambiguate"}
+    )
+    schema.data_item_normalizer._reset()
+    norm = schema.data_item_normalizer
+    # the nested path and the literal key normalize to the same identifier over max_length
+    row = {"a": {"bbbbbbbbb": 1}, "a__bbbbbbbbb": 2}
+    flattened, _ = norm._flatten("mock_table", row, 1000)
+    mapping = norm.pop_column_mapping_delta("mock_table")
+    natural = schema.naming.normalize_path("a__bbbbbbbbb")
+    assert len(natural) <= 10
+    # scalars resolve before dict descent, so the literal key claims the natural name
+    assert mapping['["a__bbbbbbbbb"]'] == natural
+    disambiguated = mapping['["a","bbbbbbbbb"]']
+    assert disambiguated != natural
+    assert len(disambiguated) <= 10
+    assert flattened == {natural: 2, disambiguated: 1}

@@ -54,6 +54,7 @@ from dlt.common.schema.typing import (
     TStoredSchema,
     TTableProcessingHints,
     TColumnProcessingHints,
+    COLUMN_MAPPING_KEY,
     TTableReferenceParam,
     TTableSchema,
     TColumnSchemaBase,
@@ -680,8 +681,9 @@ def merge_table(
             table["references"] = list(existing_refs.values())
 
     # apply table-level hints that are new or changed (skip columns, references, unchanged values)
+    # column mapping is union-merged separately in `Schema.update_table`
     for k, v in partial_table.items():
-        if k in ("columns", "references"):
+        if k in ("columns", "references", COLUMN_MAPPING_KEY):
             continue
         if table.get(k) != v:
             table[k] = v  # type: ignore[literal-required]
